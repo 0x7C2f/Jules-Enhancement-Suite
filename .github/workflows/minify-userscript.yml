@@ -1,0 +1,97 @@
+name: Minify userscript
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - jules-enhancement-suite.user.js
+      - .github/workflows/minify-userscript.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: minify-userscript-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SRC: jules-enhancement-suite.user.js
+  OUT: jules-enhancement-suite.min.user.js
+
+jobs:
+  minify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Extract metadata block
+        run: |
+          # Everything from ==UserScript== through ==/UserScript== (inclusive).
+          awk '/==UserScript==/ { keep = 1 } keep { print } /==\/UserScript==/ { exit }' "$SRC" > header.txt
+
+          if ! grep -q '==/UserScript==' header.txt; then
+            echo "::error file=$SRC::Could not find a complete ==UserScript== metadata block."
+            exit 1
+          fi
+
+          # Point auto-update at the minified file so updates do not swap it for the full build.
+          sed -i -E \
+            '/^\/\/ @(updateURL|downloadURL)/ s#jules-enhancement-suite\.user\.js#jules-enhancement-suite.min.user.js#' \
+            header.txt
+
+      - name: Minify script body
+        run: |
+          # Terser drops every comment, including the metadata block, so it is re-added below.
+          npx --yes terser@5 "$SRC" \
+            --compress \
+            --mangle \
+            --format comments=false \
+            --output body.js
+
+      - name: Assemble minified userscript
+        run: |
+          cat header.txt body.js > "$OUT"
+          echo >> "$OUT"
+
+          # Fail early if the result is not valid JavaScript.
+          node --check "$OUT"
+
+      - name: Report sizes
+        run: |
+          src_bytes=$(wc -c < "$SRC")
+          out_bytes=$(wc -c < "$OUT")
+          {
+            echo "### Userscript minified"
+            echo ""
+            echo "| File | Bytes |"
+            echo "| --- | ---: |"
+            echo "| \`$SRC\` | $src_bytes |"
+            echo "| \`$OUT\` | $out_bytes |"
+            echo ""
+            echo "Saved $(( 100 - (out_bytes * 100 / src_bytes) ))%."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit minified file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$OUT"
+          if git diff --cached --quiet; then
+            echo "Minified file is already up to date."
+          else
+            git commit -m "chore: update minified userscript"
+            git push
+          fi
+
+      - name: Upload minified file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: minified-userscript
+          path: ${{ env.OUT }}
