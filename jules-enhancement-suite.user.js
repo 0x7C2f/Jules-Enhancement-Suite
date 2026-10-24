@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jules Enhancement Suite
 // @namespace    https://github.com/0x7C2f/Jules-Enhancement-Suite
-// @version      3.2.0
-// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, start all, by-category or by-confidence suggestions, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
+// @version      3.3.0
+// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, start all, by-category or by-confidence suggestions with live counts, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
 // @author       0x7C2f
 // @match        https://jules.google.com/*
 // @homepageURL  https://github.com/0x7C2f/Jules-Enhancement-Suite
@@ -14,6 +14,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -32,9 +33,9 @@
         actionRegex: /^archive\b/i,
         allChipRegex: /^all$/i,
         maxSuggestionStartsPerRun: 50,
-        suggestionStartTimeoutMs: 6000,
+        suggestionStartTimeoutMs: 6500,
         // "delete" is intentionally excluded so a destructive dialog is never auto-confirmed.
-        confirmRegex: /^(archive|confirm|yes|ok)$/i,
+        confirmRegex: /^(archive|start|confirm|create|yes|ok)$/i,
         viewMoreRegex: /^(view|show|load)\s+(more|all)\b/i,
         timeoutMs: 3500,
         pollIntervalMs: 100,
@@ -98,19 +99,18 @@
         toolbarContainers: '.panel-button-right-container, .buttons-container'
     };
 
+    const CONFIDENCE_ORDER = ['high', 'medium', 'low'];
+
     const state = {
         isArchiving: false,
         isExpanding: false,
         isStarting: false,
         startingLabel: null,
-        // Suggestion titles already started (never restarted) or failed in this run.
-        startedTitles: new Set(),
-        failedTitles: new Set(),
+        startedKeys: new Set(),
+        failedKeys: new Set(),
         suggestionCategories: [],
         suggestionConfidences: [],
         abortRequested: false,
-        // True after the user collapsed groups with the toggle. Suppresses all
-        // automatic expansion/archiving until they expand again or run the archiver.
         groupsCollapsedByUser: false,
         archivedIds: new Set(),
         skippedIds: new Set(),
@@ -130,7 +130,7 @@
     };
 
     /* ------------------------------------------------------------------ */
-    /* Settings                                                            */
+    /* Settings                                                           */
     /* ------------------------------------------------------------------ */
 
     function loadSettings() {
@@ -188,10 +188,11 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* DOM utilities                                                       */
+    /* DOM utilities                                                      */
     /* ------------------------------------------------------------------ */
 
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const capitalize = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '');
 
     /**
      * Event-driven DOM condition waiter using MutationObserver + heartbeat fallback.
@@ -345,7 +346,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Row identification and eligibility                                  */
+    /* Row identification and eligibility                                 */
     /* ------------------------------------------------------------------ */
 
     function getRowId(row) {
@@ -427,7 +428,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Sidebar: open/close, group expand/collapse, pagination              */
+    /* Sidebar: open/close, group expand/collapse, pagination             */
     /* ------------------------------------------------------------------ */
 
     async function ensureSidebarOpen() {
@@ -568,7 +569,6 @@
         try {
             await ensureSidebarOpen();
             const changed = await setGroupsExpanded(false);
-            // Stop the automatic behaviour from immediately re-expanding what the user just closed.
             state.groupsCollapsedByUser = true;
             if (isManual && !state.abortRequested) {
                 showToast(`Collapsed ${changed} repo group${changed === 1 ? '' : 's'}.`);
@@ -591,7 +591,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Archiving                                                           */
+    /* Archiving                                                          */
     /* ------------------------------------------------------------------ */
 
     function markRowOutcome(row, id, succeeded) {
@@ -684,7 +684,9 @@
         state.archivedCount = 0;
         state.skippedCount = 0;
         state.consecutiveFailures = 0;
-        state.failureCounts.clear();
+        if (isManual) {
+            state.failureCounts.clear();
+        }
         updateToolbarUI();
 
         try {
@@ -781,7 +783,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Proactive suggestions: start all, or by category                    */
+    /* Proactive suggestions: start all, by category, or by confidence    */
     /* ------------------------------------------------------------------ */
 
     function getChipLabel(chip) {
@@ -812,7 +814,7 @@
         if (!chip.active) {
             triggerClick(chip.el);
             await waitFor(() => chip.el.getAttribute('aria-pressed') === 'true', 1500, chip.el);
-            await sleep(300);
+            await sleep(250);
         }
         return chip.el.getAttribute('aria-pressed') === 'true';
     }
@@ -822,8 +824,6 @@
         return ((titleEl || item).textContent || '').replace(/\s+/g, ' ').trim();
     }
 
-    const CONFIDENCE_ORDER = ['high', 'medium', 'low'];
-
     /** Reads "high" / "medium" / "low" from the confidence-indicator class (confidence-high etc.). */
     function getSuggestionConfidence(item) {
         const el = item.querySelector('.confidence-indicator');
@@ -832,14 +832,22 @@
         return match ? match[1].toLowerCase() : null;
     }
 
+    /** Composite key so identical titles across different repos/confidences do not collide. */
+    function getSuggestionKey(item) {
+        const title = getSuggestionTitle(item);
+        const conf = getSuggestionConfidence(item) || 'unknown';
+        const repoContext = window.location.pathname;
+        return `${repoContext}::${conf}::${title}`;
+    }
+
     function getStartableSuggestions(confidence = null) {
         return Array.from(document.querySelectorAll(SELECTORS.suggestionItem)).filter((item) => {
             if (!isVisible(item)) return false;
             const btn = item.querySelector(SELECTORS.suggestionStart);
             if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
             if (confidence && getSuggestionConfidence(item) !== confidence) return false;
-            const title = getSuggestionTitle(item);
-            return !state.startedTitles.has(title) && !state.failedTitles.has(title);
+            const key = getSuggestionKey(item);
+            return !state.startedKeys.has(key) && !state.failedKeys.has(key);
         });
     }
 
@@ -854,8 +862,6 @@
         return [...CONFIDENCE_ORDER, ...extras];
     }
 
-    const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
-
     /** If starting a suggestion navigates to the new session, go back to the list. */
     async function returnToSuggestions(listPath) {
         if (window.location.pathname !== listPath) history.back();
@@ -866,16 +872,15 @@
                 getFilterChips().length > 0,
             6000
         );
-        if (back) await sleep(400);
+        if (back) await sleep(350);
         return Boolean(back);
     }
 
     /**
      * Starts suggestions.
-     *  - startSuggestions('All')                 every suggestion
-     *  - startSuggestions('Testing')             one category (selects that filter chip)
-     *  - startSuggestions(null, 'high')          one confidence level, within the filter
-     *                                            that is currently selected
+     *  - startSuggestions('All')          every suggestion
+     *  - startSuggestions('Testing')      one category (selects that filter chip)
+     *  - startSuggestions(null, 'high')   one confidence level within the active filter
      */
     async function startSuggestions(label, confidence = null) {
         if (state.isStarting || state.isArchiving || state.isExpanding) return;
@@ -884,11 +889,11 @@
             return;
         }
 
-        const key = confidence ? `conf:${confidence}` : label;
+        const runKey = confidence ? `conf:${confidence}` : label;
         state.isStarting = true;
         state.abortRequested = false;
-        state.startingLabel = key;
-        state.failedTitles.clear();
+        state.startingLabel = runKey;
+        state.failedKeys.clear();
 
         const originalLabel = confidence ? null : getActiveChipLabel();
         const startPath = window.location.pathname;
@@ -907,7 +912,6 @@
                 }
             }
 
-            // Chip to re-select if starting a suggestion navigates away and back.
             const scopeChip = confidence ? getActiveChipLabel() : label;
             const scopeName = confidence
                 ? `${capitalize(confidence)} confidence` +
@@ -939,9 +943,10 @@
                 if (!item) break;
 
                 const btn = item.querySelector(SELECTORS.suggestionStart);
-                const title = getSuggestionTitle(item);
+                const itemKey = getSuggestionKey(item);
                 const pathBefore = window.location.pathname;
                 const listRoot = document.querySelector(SELECTORS.suggestionsList) || document.body;
+                const overlayRoot = document.querySelector(SELECTORS.overlayContainer) || document.body;
 
                 updateSuggestionBarUI(started + failed + 1, total);
                 item.scrollIntoView({ block: 'nearest' });
@@ -954,20 +959,26 @@
                         if (!btn.isConnected) return 'changed';
                         if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
                         if (window.location.pathname !== pathBefore) return 'navigated';
+                        const confirmBtn = findDialogConfirm(DEFAULT_CONFIG.confirmRegex);
+                        if (confirmBtn && !confirmBtn.dataset.jesClicked) {
+                            confirmBtn.dataset.jesClicked = 'true';
+                            triggerClick(confirmBtn);
+                        }
                         return null;
                     },
                     DEFAULT_CONFIG.suggestionStartTimeoutMs,
-                    listRoot
+                    [listRoot, overlayRoot]
                 );
 
                 if (!outcome) {
-                    state.failedTitles.add(title);
+                    state.failedKeys.add(itemKey);
                     failed++;
                     consecutive++;
+                    await clearOverlays();
                     continue;
                 }
 
-                state.startedTitles.add(title);
+                state.startedKeys.add(itemKey);
                 started++;
                 consecutive = 0;
 
@@ -1013,16 +1024,26 @@
         const bar = document.getElementById('jes-suggest-bar');
         if (!bar) return;
 
+        const allVisibleCount = getStartableSuggestions(null).length;
+
         for (const btn of bar.querySelectorAll('button')) {
             const key = btn.dataset.key;
+            const baseText = btn.dataset.text;
             const isRunning = state.isStarting && state.startingLabel === key;
 
-            let nextText = btn.dataset.text;
+            let nextText = baseText;
             if (isRunning) {
                 nextText = state.abortRequested
                     ? 'Stopping...'
                     : `Starting${total > 0 ? ` (${current}/${total})` : ''} - Stop`;
+            } else if (key === 'All') {
+                nextText = `${baseText} (${allVisibleCount})`;
+            } else if (key.startsWith('conf:')) {
+                const level = key.slice(5);
+                const levelCount = getStartableSuggestions(level).length;
+                nextText = `${baseText} (${levelCount})`;
             }
+
             const nextState = isRunning ? 'running' : 'idle';
             const nextDisabled =
                 (state.isStarting && !isRunning) || state.isArchiving || state.isExpanding;
@@ -1058,6 +1079,7 @@
             existing.parentElement === chipsRow.parentElement &&
             existing.dataset.signature === signature
         ) {
+            updateSuggestionBarUI();
             return;
         }
         if (existing) existing.remove();
@@ -1116,7 +1138,7 @@
                 makeButton({
                     key: category,
                     text: category,
-                    title: `Jules Enhancement Suite: Start every "${category}" suggestion`,
+                    title: `Jules Enhancement Suite: Switch to "${category}" and start all matching suggestions`,
                     primary: false,
                     run: () => startSuggestions(category)
                 })
@@ -1152,7 +1174,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* UI: styles, toast, toolbar                                          */
+    /* UI: styles, toast, toolbar                                         */
     /* ------------------------------------------------------------------ */
 
     function injectStyles() {
@@ -1360,7 +1382,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Keyboard                                                            */
+    /* Keyboard                                                           */
     /* ------------------------------------------------------------------ */
 
     function isEditableTarget(el) {
@@ -1404,20 +1426,24 @@
         }
     });
 
-    // Keep the toggle label honest when the user opens or closes a group by hand.
+    // Keep UI state synchronized when the user clicks repo headers or filter chips by hand.
     document.addEventListener(
         'click',
         (e) => {
             const target = e.target;
-            if (target instanceof Element && target.closest(SELECTORS.sourceHeader)) {
-                setTimeout(updateToolbarUI, 300);
+            if (!(target instanceof Element)) return;
+            if (target.closest(SELECTORS.sourceHeader) || target.closest(SELECTORS.filterChip)) {
+                setTimeout(() => {
+                    updateToolbarUI();
+                    updateSuggestionBarUI();
+                }, 250);
             }
         },
         true
     );
 
     /* ------------------------------------------------------------------ */
-    /* Userscript menu                                                     */
+    /* Userscript menu                                                    */
     /* ------------------------------------------------------------------ */
 
     function registerMenus() {
@@ -1466,7 +1492,7 @@
     }
 
     /* ------------------------------------------------------------------ */
-    /* Scheduling, SPA hooks, observer                                     */
+    /* Scheduling, SPA hooks, observer                                    */
     /* ------------------------------------------------------------------ */
 
     function hasPendingArchiveWork() {
@@ -1489,16 +1515,14 @@
                 state.lastPathname = window.location.pathname;
                 state.initialExpansionDone = false;
                 state.skippedIds.clear();
+                state.failureCounts.clear();
             }
 
             injectToolbarUI();
             injectSuggestionBar();
             updateToolbarUI();
 
-            // Avoid background-tab timer throttling causing false DOM wait timeouts
             if (document.hidden) return;
-
-            // The user deliberately collapsed the groups: leave them alone.
             if (state.groupsCollapsedByUser) return;
 
             if (getSetting('autoArchive') && hasPendingArchiveWork()) {
@@ -1513,17 +1537,25 @@
     }
 
     function hookNavigationAndVisibility() {
-        const wrapHistoryMethod = (type) => {
-            const orig = history[type];
-            if (typeof orig !== 'function') return;
-            history[type] = function (...args) {
-                const result = orig.apply(this, args);
-                scheduleCheck();
-                return result;
+        if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+            window.navigation.addEventListener('navigate', () => setTimeout(scheduleCheck, 50));
+        } else {
+            const pageHistory =
+                typeof unsafeWindow !== 'undefined' && unsafeWindow.history
+                    ? unsafeWindow.history
+                    : history;
+            const wrapHistoryMethod = (type) => {
+                const orig = pageHistory[type];
+                if (typeof orig !== 'function') return;
+                pageHistory[type] = function (...args) {
+                    const result = orig.apply(this, args);
+                    scheduleCheck();
+                    return result;
+                };
             };
-        };
-        wrapHistoryMethod('pushState');
-        wrapHistoryMethod('replaceState');
+            wrapHistoryMethod('pushState');
+            wrapHistoryMethod('replaceState');
+        }
         window.addEventListener('popstate', scheduleCheck);
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) scheduleCheck();
