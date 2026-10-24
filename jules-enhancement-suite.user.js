@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jules Enhancement Suite
 // @namespace    https://github.com/0x7C2f/Jules-Enhancement-Suite
-// @version      3.1.0
-// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, start all or by-category suggestions, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
+// @version      3.2.0
+// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, start all, by-category or by-confidence suggestions, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
 // @author       0x7C2f
 // @match        https://jules.google.com/*
 // @homepageURL  https://github.com/0x7C2f/Jules-Enhancement-Suite
@@ -107,6 +107,7 @@
         startedTitles: new Set(),
         failedTitles: new Set(),
         suggestionCategories: [],
+        suggestionConfidences: [],
         abortRequested: false,
         // True after the user collapsed groups with the toggle. Suppresses all
         // automatic expansion/archiving until they expand again or run the archiver.
@@ -821,15 +822,39 @@
         return ((titleEl || item).textContent || '').replace(/\s+/g, ' ').trim();
     }
 
-    function getStartableSuggestions() {
+    const CONFIDENCE_ORDER = ['high', 'medium', 'low'];
+
+    /** Reads "high" / "medium" / "low" from the confidence-indicator class (confidence-high etc.). */
+    function getSuggestionConfidence(item) {
+        const el = item.querySelector('.confidence-indicator');
+        if (!el) return null;
+        const match = /\bconfidence-(?!indicator\b)([a-z]+)/i.exec(el.className || '');
+        return match ? match[1].toLowerCase() : null;
+    }
+
+    function getStartableSuggestions(confidence = null) {
         return Array.from(document.querySelectorAll(SELECTORS.suggestionItem)).filter((item) => {
             if (!isVisible(item)) return false;
             const btn = item.querySelector(SELECTORS.suggestionStart);
             if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+            if (confidence && getSuggestionConfidence(item) !== confidence) return false;
             const title = getSuggestionTitle(item);
             return !state.startedTitles.has(title) && !state.failedTitles.has(title);
         });
     }
+
+    /** High, medium and low always; plus any other level the page shows. */
+    function getConfidenceLevels() {
+        const found = new Set(CONFIDENCE_ORDER);
+        for (const item of document.querySelectorAll(SELECTORS.suggestionItem)) {
+            const level = getSuggestionConfidence(item);
+            if (level) found.add(level);
+        }
+        const extras = Array.from(found).filter((l) => !CONFIDENCE_ORDER.includes(l)).sort();
+        return [...CONFIDENCE_ORDER, ...extras];
+    }
+
+    const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
     /** If starting a suggestion navigates to the new session, go back to the list. */
     async function returnToSuggestions(listPath) {
@@ -845,19 +870,27 @@
         return Boolean(back);
     }
 
-    async function startSuggestions(label) {
+    /**
+     * Starts suggestions.
+     *  - startSuggestions('All')                 every suggestion
+     *  - startSuggestions('Testing')             one category (selects that filter chip)
+     *  - startSuggestions(null, 'high')          one confidence level, within the filter
+     *                                            that is currently selected
+     */
+    async function startSuggestions(label, confidence = null) {
         if (state.isStarting || state.isArchiving || state.isExpanding) return;
         if (!document.querySelector(SELECTORS.suggestionsList)) {
             showToast('No suggestions list found on this page.', true);
             return;
         }
 
+        const key = confidence ? `conf:${confidence}` : label;
         state.isStarting = true;
         state.abortRequested = false;
-        state.startingLabel = label;
+        state.startingLabel = key;
         state.failedTitles.clear();
 
-        const originalLabel = getActiveChipLabel();
+        const originalLabel = confidence ? null : getActiveChipLabel();
         const startPath = window.location.pathname;
         let started = 0;
         let failed = 0;
@@ -866,22 +899,31 @@
         updateSuggestionBarUI();
 
         try {
-            const selected = await selectChip(label);
-            if (!selected && !DEFAULT_CONFIG.allChipRegex.test(label)) {
-                showToast(`Could not select the "${label}" filter.`, true);
-                return;
+            if (!confidence) {
+                const selected = await selectChip(label);
+                if (!selected && !DEFAULT_CONFIG.allChipRegex.test(label)) {
+                    showToast(`Could not select the "${label}" filter.`, true);
+                    return;
+                }
             }
 
-            const queued = getStartableSuggestions().length;
+            // Chip to re-select if starting a suggestion navigates away and back.
+            const scopeChip = confidence ? getActiveChipLabel() : label;
+            const scopeName = confidence
+                ? `${capitalize(confidence)} confidence` +
+                  (scopeChip && !DEFAULT_CONFIG.allChipRegex.test(scopeChip) ? ` in ${scopeChip}` : '')
+                : label;
+
+            const queued = getStartableSuggestions(confidence).length;
             if (queued === 0) {
-                showToast(`No suggestions to start in "${label}".`);
+                showToast(`No suggestions to start for "${scopeName}".`);
                 return;
             }
 
             const total = Math.min(queued, DEFAULT_CONFIG.maxSuggestionStartsPerRun);
             if (getSetting('confirmBeforeStart')) {
                 const proceed = window.confirm(
-                    `Start ${total} "${label}" suggestion${total === 1 ? '' : 's'}?\n\n` +
+                    `Start ${total} "${scopeName}" suggestion${total === 1 ? '' : 's'}?\n\n` +
                     'Each one creates a Jules session and counts toward your usage limits.'
                 );
                 if (!proceed) return;
@@ -893,7 +935,7 @@
                     break;
                 }
 
-                const item = getStartableSuggestions()[0];
+                const item = getStartableSuggestions(confidence)[0];
                 if (!item) break;
 
                 const btn = item.querySelector(SELECTORS.suggestionStart);
@@ -938,7 +980,7 @@
                         );
                         return;
                     }
-                    await selectChip(label);
+                    if (scopeChip) await selectChip(scopeChip);
                 }
             }
 
@@ -957,7 +999,7 @@
             state.startingLabel = null;
             if (
                 originalLabel &&
-                originalLabel.toLowerCase() !== label.toLowerCase() &&
+                originalLabel.toLowerCase() !== String(label).toLowerCase() &&
                 window.location.pathname === startPath
             ) {
                 await selectChip(originalLabel);
@@ -972,11 +1014,10 @@
         if (!bar) return;
 
         for (const btn of bar.querySelectorAll('button')) {
-            const label = btn.dataset.category;
-            const isRunning = state.isStarting && state.startingLabel === label;
-            const base = DEFAULT_CONFIG.allChipRegex.test(label) ? 'All' : label;
+            const key = btn.dataset.key;
+            const isRunning = state.isStarting && state.startingLabel === key;
 
-            let nextText = base;
+            let nextText = btn.dataset.text;
             if (isRunning) {
                 nextText = state.abortRequested
                     ? 'Stopping...'
@@ -992,7 +1033,10 @@
         }
     }
 
-    /** Adds a "Start" row under the filter chips. Rebuilt when the category set changes. */
+    /**
+     * Adds a "Start" row under the filter chips: All, one button per category, and one
+     * per confidence level. Rebuilt whenever the category or level set changes.
+     */
     function injectSuggestionBar() {
         const chipsRow = document.querySelector(SELECTORS.filterChips);
         const existing = document.getElementById('jes-suggest-bar');
@@ -1005,7 +1049,8 @@
         const categories = getFilterChips()
             .map((c) => c.label)
             .filter((l) => !DEFAULT_CONFIG.allChipRegex.test(l));
-        const signature = categories.join('|');
+        const levels = getConfidenceLevels();
+        const signature = `${categories.join('|')}##${levels.join('|')}`;
 
         if (
             existing &&
@@ -1023,44 +1068,85 @@
         bar.id = 'jes-suggest-bar';
         bar.dataset.signature = signature;
 
-        const caption = document.createElement('span');
-        caption.className = 'jes-suggest-caption';
-        caption.textContent = 'Start suggestions:';
-        bar.appendChild(caption);
+        const makeCaption = (text) => {
+            const span = document.createElement('span');
+            span.className = 'jes-suggest-caption';
+            span.textContent = text;
+            return span;
+        };
 
-        const makeButton = (label, primary) => {
+        const makeButton = ({ key, text, title, primary, run }) => {
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'jes-btn';
-            btn.dataset.category = label;
+            btn.dataset.key = key;
+            btn.dataset.text = text;
             btn.dataset.state = 'idle';
             if (!primary) btn.dataset.variant = 'secondary';
-            btn.title = primary
-                ? 'Jules Enhancement Suite: Start every suggestion (Alt+Shift+T | Esc to Stop)'
-                : `Jules Enhancement Suite: Start every "${label}" suggestion`;
+            btn.title = title;
+            btn.textContent = text;
             btn.addEventListener('click', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 if (state.isStarting) {
-                    if (state.startingLabel === label) {
+                    if (state.startingLabel === key) {
                         state.abortRequested = true;
                         updateSuggestionBarUI();
                     }
                     return;
                 }
-                startSuggestions(label);
+                run();
             });
             return btn;
         };
 
-        bar.appendChild(makeButton('All', true));
-        for (const category of categories) bar.appendChild(makeButton(category, false));
+        bar.append(
+            makeCaption('Start suggestions:'),
+            makeButton({
+                key: 'All',
+                text: 'All',
+                title: 'Jules Enhancement Suite: Start every suggestion (Alt+Shift+T | Esc to Stop)',
+                primary: true,
+                run: () => startSuggestions('All')
+            })
+        );
+
+        for (const category of categories) {
+            bar.appendChild(
+                makeButton({
+                    key: category,
+                    text: category,
+                    title: `Jules Enhancement Suite: Start every "${category}" suggestion`,
+                    primary: false,
+                    run: () => startSuggestions(category)
+                })
+            );
+        }
+
+        bar.appendChild(makeCaption('By confidence:'));
+        for (const level of levels) {
+            bar.appendChild(
+                makeButton({
+                    key: `conf:${level}`,
+                    text: capitalize(level),
+                    title:
+                        `Jules Enhancement Suite: Start every ${level} confidence suggestion ` +
+                        'within the filter that is currently selected',
+                    primary: false,
+                    run: () => startSuggestions(null, level)
+                })
+            );
+        }
 
         chipsRow.insertAdjacentElement('afterend', bar);
         updateSuggestionBarUI();
 
-        if (state.suggestionCategories.join('|') !== signature) {
+        if (
+            state.suggestionCategories.join('|') !== categories.join('|') ||
+            state.suggestionConfidences.join('|') !== levels.join('|')
+        ) {
             state.suggestionCategories = categories;
+            state.suggestionConfidences = levels;
             registerMenus();
         }
     }
@@ -1363,6 +1449,12 @@
             GM_registerMenuCommand('Start All Suggestions (Alt+Shift+T)', () => startSuggestions('All')),
             ...state.suggestionCategories.map((category) =>
                 GM_registerMenuCommand(`Start Suggestions: ${category}`, () => startSuggestions(category))
+            ),
+            ...state.suggestionConfidences.map((level) =>
+                GM_registerMenuCommand(
+                    `Start Suggestions: ${capitalize(level)} confidence`,
+                    () => startSuggestions(null, level)
+                )
             ),
             GM_registerMenuCommand(`Auto-Archive Sessions: [${onOff('autoArchive')}]`, flip('autoArchive', 'Auto-Archive')),
             GM_registerMenuCommand(`Auto-Expand Repo Groups: [${onOff('autoExpandSidebar')}]`, flip('autoExpandSidebar', 'Auto-Expand Repo Groups')),
