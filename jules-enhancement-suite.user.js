@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jules Enhancement Suite
 // @namespace    https://github.com/0x7C2f/Jules-Enhancement-Suite
-// @version      3.0.0
-// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
+// @version      3.1.0
+// @description  UI enhancement and workflow automation suite for jules.google.com: expand/collapse toggle for repo groups, start all or by-category suggestions, smart session archiving, toolbar controls, keyboard shortcuts, and observer-backed CDK synchronization
 // @author       0x7C2f
 // @match        https://jules.google.com/*
 // @homepageURL  https://github.com/0x7C2f/Jules-Enhancement-Suite
@@ -28,7 +28,11 @@
         skipActiveSession: true,
         onlyCompletedOrFailed: true,
         confirmBeforeArchive: false,
+        confirmBeforeStart: true,
         actionRegex: /^archive\b/i,
+        allChipRegex: /^all$/i,
+        maxSuggestionStartsPerRun: 50,
+        suggestionStartTimeoutMs: 6000,
         // "delete" is intentionally excluded so a destructive dialog is never auto-confirmed.
         confirmRegex: /^(archive|confirm|yes|ok)$/i,
         viewMoreRegex: /^(view|show|load)\s+(more|all)\b/i,
@@ -44,7 +48,8 @@
         'autoExpandSidebar',
         'skipActiveSession',
         'onlyCompletedOrFailed',
-        'confirmBeforeArchive'
+        'confirmBeforeArchive',
+        'confirmBeforeStart'
     ];
 
     const SELECTORS = {
@@ -56,6 +61,12 @@
         taskRow: '.task-link-container',
         taskContainer: 'a.task-container, .task-container',
         taskDescription: '.task-description',
+        suggestionsList: '.suggestions-list',
+        filterChips: '.suggestions-list .filter-chips',
+        filterChip: '.suggestions-list .filter-chip',
+        suggestionItem: '.suggestion-item',
+        suggestionStart: '.start-button',
+        suggestionTitle: '.suggestion-title',
         activeIndicators: [
             '.working-dots',
             '.needs-attention',
@@ -90,6 +101,12 @@
     const state = {
         isArchiving: false,
         isExpanding: false,
+        isStarting: false,
+        startingLabel: null,
+        // Suggestion titles already started (never restarted) or failed in this run.
+        startedTitles: new Set(),
+        failedTitles: new Set(),
+        suggestionCategories: [],
         abortRequested: false,
         // True after the user collapsed groups with the toggle. Suppresses all
         // automatic expansion/archiving until they expand again or run the archiver.
@@ -564,7 +581,7 @@
 
     /** One entry point for the toolbar button, hotkey and menu command. */
     async function toggleGroups() {
-        if (state.isArchiving || state.isExpanding) return;
+        if (state.isArchiving || state.isExpanding || state.isStarting) return;
         if (areAllGroupsExpanded()) {
             await collapseAllGroups(true);
         } else {
@@ -660,7 +677,7 @@
     }
 
     async function runArchiver(isManual = false) {
-        if (state.isArchiving) return;
+        if (state.isArchiving || state.isStarting) return;
         state.isArchiving = true;
         state.abortRequested = false;
         state.archivedCount = 0;
@@ -738,7 +755,7 @@
             updateToolbarUI();
             return;
         }
-        if (state.isExpanding) return;
+        if (state.isExpanding || state.isStarting) return;
 
         if (getSetting('confirmBeforeArchive')) {
             const loaded = getEligibleRows().length;
@@ -760,6 +777,292 @@
         const count = getEligibleRows().length;
         const total = document.querySelectorAll(SELECTORS.taskRow).length;
         showToast(`${count} of ${total} loaded sessions are eligible for archiving.`);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Proactive suggestions: start all, or by category                    */
+    /* ------------------------------------------------------------------ */
+
+    function getChipLabel(chip) {
+        const clone = chip.cloneNode(true);
+        clone.querySelectorAll('mat-icon').forEach((n) => n.remove());
+        return (clone.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function getFilterChips() {
+        return Array.from(document.querySelectorAll(SELECTORS.filterChip))
+            .map((el) => ({
+                el,
+                label: getChipLabel(el),
+                active: el.getAttribute('aria-pressed') === 'true'
+            }))
+            .filter((c) => c.label);
+    }
+
+    function getActiveChipLabel() {
+        const active = getFilterChips().find((c) => c.active);
+        return active ? active.label : null;
+    }
+
+    /** Activates a filter chip. Never clicks an already active chip, since that may clear it. */
+    async function selectChip(label) {
+        const chip = getFilterChips().find((c) => c.label.toLowerCase() === label.toLowerCase());
+        if (!chip) return false;
+        if (!chip.active) {
+            triggerClick(chip.el);
+            await waitFor(() => chip.el.getAttribute('aria-pressed') === 'true', 1500, chip.el);
+            await sleep(300);
+        }
+        return chip.el.getAttribute('aria-pressed') === 'true';
+    }
+
+    function getSuggestionTitle(item) {
+        const titleEl = item.querySelector(SELECTORS.suggestionTitle);
+        return ((titleEl || item).textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function getStartableSuggestions() {
+        return Array.from(document.querySelectorAll(SELECTORS.suggestionItem)).filter((item) => {
+            if (!isVisible(item)) return false;
+            const btn = item.querySelector(SELECTORS.suggestionStart);
+            if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') return false;
+            const title = getSuggestionTitle(item);
+            return !state.startedTitles.has(title) && !state.failedTitles.has(title);
+        });
+    }
+
+    /** If starting a suggestion navigates to the new session, go back to the list. */
+    async function returnToSuggestions(listPath) {
+        if (window.location.pathname !== listPath) history.back();
+        const back = await waitFor(
+            () =>
+                window.location.pathname === listPath &&
+                document.querySelector(SELECTORS.suggestionsList) &&
+                getFilterChips().length > 0,
+            6000
+        );
+        if (back) await sleep(400);
+        return Boolean(back);
+    }
+
+    async function startSuggestions(label) {
+        if (state.isStarting || state.isArchiving || state.isExpanding) return;
+        if (!document.querySelector(SELECTORS.suggestionsList)) {
+            showToast('No suggestions list found on this page.', true);
+            return;
+        }
+
+        state.isStarting = true;
+        state.abortRequested = false;
+        state.startingLabel = label;
+        state.failedTitles.clear();
+
+        const originalLabel = getActiveChipLabel();
+        const startPath = window.location.pathname;
+        let started = 0;
+        let failed = 0;
+        let consecutive = 0;
+        updateToolbarUI();
+        updateSuggestionBarUI();
+
+        try {
+            const selected = await selectChip(label);
+            if (!selected && !DEFAULT_CONFIG.allChipRegex.test(label)) {
+                showToast(`Could not select the "${label}" filter.`, true);
+                return;
+            }
+
+            const queued = getStartableSuggestions().length;
+            if (queued === 0) {
+                showToast(`No suggestions to start in "${label}".`);
+                return;
+            }
+
+            const total = Math.min(queued, DEFAULT_CONFIG.maxSuggestionStartsPerRun);
+            if (getSetting('confirmBeforeStart')) {
+                const proceed = window.confirm(
+                    `Start ${total} "${label}" suggestion${total === 1 ? '' : 's'}?\n\n` +
+                    'Each one creates a Jules session and counts toward your usage limits.'
+                );
+                if (!proceed) return;
+            }
+
+            while (!state.abortRequested && started + failed < total) {
+                if (consecutive >= DEFAULT_CONFIG.maxConsecutiveFailures) {
+                    showToast(`Stopped after ${consecutive} consecutive failures.`, true);
+                    break;
+                }
+
+                const item = getStartableSuggestions()[0];
+                if (!item) break;
+
+                const btn = item.querySelector(SELECTORS.suggestionStart);
+                const title = getSuggestionTitle(item);
+                const pathBefore = window.location.pathname;
+                const listRoot = document.querySelector(SELECTORS.suggestionsList) || document.body;
+
+                updateSuggestionBarUI(started + failed + 1, total);
+                item.scrollIntoView({ block: 'nearest' });
+                triggerHoverAndFocus(btn);
+                triggerClick(btn);
+
+                const outcome = await waitFor(
+                    () => {
+                        if (!item.isConnected) return 'removed';
+                        if (!btn.isConnected) return 'changed';
+                        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') return 'disabled';
+                        if (window.location.pathname !== pathBefore) return 'navigated';
+                        return null;
+                    },
+                    DEFAULT_CONFIG.suggestionStartTimeoutMs,
+                    listRoot
+                );
+
+                if (!outcome) {
+                    state.failedTitles.add(title);
+                    failed++;
+                    consecutive++;
+                    continue;
+                }
+
+                state.startedTitles.add(title);
+                started++;
+                consecutive = 0;
+
+                if (outcome === 'navigated') {
+                    const back = await returnToSuggestions(pathBefore);
+                    if (!back) {
+                        showToast(
+                            `Started ${started}, but could not return to the suggestions list. Stopping.`,
+                            true
+                        );
+                        return;
+                    }
+                    await selectChip(label);
+                }
+            }
+
+            const prefix = state.abortRequested ? 'Stopped. ' : '';
+            showToast(
+                `${prefix}Started ${started} suggestion${started === 1 ? '' : 's'}` +
+                (failed ? `, ${failed} failed.` : '.'),
+                failed > 0 && started === 0
+            );
+        } catch (err) {
+            console.error(`${LOG_PREFIX} Error starting suggestions:`, err);
+            showToast('Starting suggestions failed. Check console.', true);
+        } finally {
+            state.isStarting = false;
+            state.abortRequested = false;
+            state.startingLabel = null;
+            if (
+                originalLabel &&
+                originalLabel.toLowerCase() !== label.toLowerCase() &&
+                window.location.pathname === startPath
+            ) {
+                await selectChip(originalLabel);
+            }
+            updateToolbarUI();
+            updateSuggestionBarUI();
+        }
+    }
+
+    function updateSuggestionBarUI(current = 0, total = 0) {
+        const bar = document.getElementById('jes-suggest-bar');
+        if (!bar) return;
+
+        for (const btn of bar.querySelectorAll('button')) {
+            const label = btn.dataset.category;
+            const isRunning = state.isStarting && state.startingLabel === label;
+            const base = DEFAULT_CONFIG.allChipRegex.test(label) ? 'All' : label;
+
+            let nextText = base;
+            if (isRunning) {
+                nextText = state.abortRequested
+                    ? 'Stopping...'
+                    : `Starting${total > 0 ? ` (${current}/${total})` : ''} - Stop`;
+            }
+            const nextState = isRunning ? 'running' : 'idle';
+            const nextDisabled =
+                (state.isStarting && !isRunning) || state.isArchiving || state.isExpanding;
+
+            if (btn.textContent !== nextText) btn.textContent = nextText;
+            if (btn.dataset.state !== nextState) btn.dataset.state = nextState;
+            if (btn.disabled !== nextDisabled) btn.disabled = nextDisabled;
+        }
+    }
+
+    /** Adds a "Start" row under the filter chips. Rebuilt when the category set changes. */
+    function injectSuggestionBar() {
+        const chipsRow = document.querySelector(SELECTORS.filterChips);
+        const existing = document.getElementById('jes-suggest-bar');
+
+        if (!chipsRow || !chipsRow.parentElement) {
+            if (existing) existing.remove();
+            return;
+        }
+
+        const categories = getFilterChips()
+            .map((c) => c.label)
+            .filter((l) => !DEFAULT_CONFIG.allChipRegex.test(l));
+        const signature = categories.join('|');
+
+        if (
+            existing &&
+            existing.isConnected &&
+            existing.parentElement === chipsRow.parentElement &&
+            existing.dataset.signature === signature
+        ) {
+            return;
+        }
+        if (existing) existing.remove();
+
+        injectStyles();
+
+        const bar = document.createElement('div');
+        bar.id = 'jes-suggest-bar';
+        bar.dataset.signature = signature;
+
+        const caption = document.createElement('span');
+        caption.className = 'jes-suggest-caption';
+        caption.textContent = 'Start suggestions:';
+        bar.appendChild(caption);
+
+        const makeButton = (label, primary) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'jes-btn';
+            btn.dataset.category = label;
+            btn.dataset.state = 'idle';
+            if (!primary) btn.dataset.variant = 'secondary';
+            btn.title = primary
+                ? 'Jules Enhancement Suite: Start every suggestion (Alt+Shift+T | Esc to Stop)'
+                : `Jules Enhancement Suite: Start every "${label}" suggestion`;
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (state.isStarting) {
+                    if (state.startingLabel === label) {
+                        state.abortRequested = true;
+                        updateSuggestionBarUI();
+                    }
+                    return;
+                }
+                startSuggestions(label);
+            });
+            return btn;
+        };
+
+        bar.appendChild(makeButton('All', true));
+        for (const category of categories) bar.appendChild(makeButton(category, false));
+
+        chipsRow.insertAdjacentElement('afterend', bar);
+        updateSuggestionBarUI();
+
+        if (state.suggestionCategories.join('|') !== signature) {
+            state.suggestionCategories = categories;
+            registerMenus();
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -814,6 +1117,22 @@
             .jes-btn:disabled {
                 opacity: 0.55;
                 cursor: not-allowed;
+            }
+            #jes-suggest-bar {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 6px;
+                margin: 8px 0;
+            }
+            #jes-suggest-bar .jes-suggest-caption {
+                font-size: 12px;
+                color: var(--text-secondary, #a8a1cb);
+                margin-right: 2px;
+            }
+            #jes-suggest-bar .jes-btn {
+                height: 28px;
+                padding: 0 10px;
             }
             #jes-toast {
                 position: fixed;
@@ -893,6 +1212,7 @@
 
             if (archiveBtn.textContent !== nextText) archiveBtn.textContent = nextText;
             if (archiveBtn.dataset.state !== nextState) archiveBtn.dataset.state = nextState;
+            archiveBtn.disabled = state.isStarting;
         }
 
         if (toggleBtn) {
@@ -907,8 +1227,10 @@
             if (toggleBtn.textContent !== nextToggleText) toggleBtn.textContent = nextToggleText;
             if (toggleBtn.title !== nextTitle) toggleBtn.title = nextTitle;
             toggleBtn.setAttribute('aria-pressed', String(expanded));
-            toggleBtn.disabled = state.isExpanding || state.isArchiving;
+            toggleBtn.disabled = state.isExpanding || state.isArchiving || state.isStarting;
         }
+
+        if (!state.isStarting) updateSuggestionBarUI();
     }
 
     function injectToolbarUI() {
@@ -968,9 +1290,14 @@
     }
 
     window.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && (state.isArchiving || state.isExpanding) && !state.abortRequested) {
+        if (
+            e.key === 'Escape' &&
+            (state.isArchiving || state.isExpanding || state.isStarting) &&
+            !state.abortRequested
+        ) {
             state.abortRequested = true;
             updateToolbarUI();
+            updateSuggestionBarUI();
             return;
         }
 
@@ -985,6 +1312,9 @@
         } else if (e.code === 'KeyS') {
             e.preventDefault();
             toggleSidebarPanel();
+        } else if (e.code === 'KeyT') {
+            e.preventDefault();
+            startSuggestions('All');
         }
     });
 
@@ -1030,11 +1360,16 @@
             GM_registerMenuCommand('Expand / Collapse All Groups (Alt+Shift+E)', toggleGroups),
             GM_registerMenuCommand('Toggle Sidebar Panel (Alt+Shift+S)', toggleSidebarPanel),
             GM_registerMenuCommand('Show Eligible Session Count', showEligibleCount),
+            GM_registerMenuCommand('Start All Suggestions (Alt+Shift+T)', () => startSuggestions('All')),
+            ...state.suggestionCategories.map((category) =>
+                GM_registerMenuCommand(`Start Suggestions: ${category}`, () => startSuggestions(category))
+            ),
             GM_registerMenuCommand(`Auto-Archive Sessions: [${onOff('autoArchive')}]`, flip('autoArchive', 'Auto-Archive')),
             GM_registerMenuCommand(`Auto-Expand Repo Groups: [${onOff('autoExpandSidebar')}]`, flip('autoExpandSidebar', 'Auto-Expand Repo Groups')),
             GM_registerMenuCommand(`Archive Only Completed/Failed: [${onOff('onlyCompletedOrFailed')}]`, flip('onlyCompletedOrFailed', 'Only Completed/Failed')),
             GM_registerMenuCommand(`Skip Active Session: [${onOff('skipActiveSession')}]`, flip('skipActiveSession', 'Skip Active Session')),
-            GM_registerMenuCommand(`Confirm Before Manual Archive: [${onOff('confirmBeforeArchive')}]`, flip('confirmBeforeArchive', 'Confirm Before Manual Archive'))
+            GM_registerMenuCommand(`Confirm Before Manual Archive: [${onOff('confirmBeforeArchive')}]`, flip('confirmBeforeArchive', 'Confirm Before Manual Archive')),
+            GM_registerMenuCommand(`Confirm Before Starting Suggestions: [${onOff('confirmBeforeStart')}]`, flip('confirmBeforeStart', 'Confirm Before Starting Suggestions'))
         );
     }
 
@@ -1054,10 +1389,10 @@
     }
 
     function scheduleCheck() {
-        if (state.isArchiving) return;
+        if (state.isArchiving || state.isStarting) return;
         if (state.debounceTimer) clearTimeout(state.debounceTimer);
         state.debounceTimer = setTimeout(async () => {
-            if (state.isArchiving) return;
+            if (state.isArchiving || state.isStarting) return;
             if (window.location.pathname !== state.lastPathname) {
                 state.lastPathname = window.location.pathname;
                 state.initialExpansionDone = false;
@@ -1065,6 +1400,7 @@
             }
 
             injectToolbarUI();
+            injectSuggestionBar();
             updateToolbarUI();
 
             // Avoid background-tab timer throttling causing false DOM wait timeouts
@@ -1103,14 +1439,15 @@
     }
 
     const observer = new MutationObserver((mutations) => {
-        if (state.isArchiving) return;
+        if (state.isArchiving || state.isStarting) return;
         const isExternalMutation = mutations.some((m) => {
             const target = m.target;
             return (
                 target instanceof Element &&
                 target.id !== 'jes-toast' &&
                 target.id !== 'jes-toolbar-group' &&
-                !target.closest('#jes-toast, #jes-toolbar-group')
+                target.id !== 'jes-suggest-bar' &&
+                !target.closest('#jes-toast, #jes-toolbar-group, #jes-suggest-bar')
             );
         });
         if (isExternalMutation) scheduleCheck();
