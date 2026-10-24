@@ -83,12 +83,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$OUT"
+
           if git diff --cached --quiet; then
             echo "Minified file is already up to date."
-          else
-            git commit -m "chore: update minified userscript"
-            git push
+            exit 0
           fi
+
+          git commit -m "chore: update minified userscript"
+
+          for attempt in 1 2 3; do
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              exit 0
+            fi
+            echo "Push attempt $attempt failed, retrying..."
+            sleep $((attempt * 3))
+          done
+
+          echo "::error::Could not push after 3 attempts."
+          exit 1
 
       - name: Upload minified file as artifact
         uses: actions/upload-artifact@v4
