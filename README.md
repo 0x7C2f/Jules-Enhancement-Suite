@@ -2,8 +2,8 @@
 
 A UI enhancement and workflow automation userscript for [`jules.google.com`](https://jules.google.com/) featuring automatic repository group expansion, fault-tolerant session archiving, dedicated toolbar controls, keyboard shortcuts, and observer-backed Angular CDK synchronization.
 
-[![Install Userscript](https://img.shields.io/badge/Install-jules--enhancement--suite.user.js-715cd7?style=flat-square)](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.user.js)
-![Version](https://img.shields.io/badge/version-3.2.0-blue?style=flat-square)
+[![Install Userscript](https://img.shields.io/badge/Install-jules--enhancement--suite.min.user.js-715cd7?style=flat-square)](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.min.user.js)
+![Version](https://img.shields.io/badge/version-3.3.0-blue?style=flat-square)
 
 ---
 
@@ -28,7 +28,16 @@ A UI enhancement and workflow automation userscript for [`jules.google.com`](htt
    * [Violentmonkey](https://violentmonkey.github.io/) (Recommended)
    * [Tampermonkey](https://www.tampermonkey.net/)
 2. Click the raw install link below to install and enable automatic updates from the `main` branch:
-   * **[Install `jules-enhancement-suite.user.js`](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.user.js)**
+   * **[Install `jules-enhancement-suite.min.user.js`](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.min.user.js)**
+
+### Which file should I install?
+
+| File | Use it for |
+| :--- | :--- |
+| [`jules-enhancement-suite.min.user.js`](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.min.user.js) | **Recommended.** Minified build for everyday use. Smaller and loads faster, with the same features and settings. Auto-updates from this file. |
+| [`jules-enhancement-suite.user.js`](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.user.js) | Readable source. Install this one if you want to read the code, edit [`DEFAULT_CONFIG`](#configuration-tuning), or debug. Auto-updates from this file. |
+
+The two builds are functionally identical, but install only one of them. They share the same script name and namespace, so your userscript manager treats them as the same script.
 
 ---
 
@@ -79,7 +88,7 @@ Open your userscript manager's extension popup while on `jules.google.com` to co
 
 ## Configuration Tuning
 
-Internal thresholds can be customized in the `DEFAULT_CONFIG` block at the top of `jules-enhancement-suite.user.js`:
+The on/off settings above can be changed from the userscript menu in either build. To change the internal thresholds below, install the readable [`jules-enhancement-suite.user.js`](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.user.js) and edit the `DEFAULT_CONFIG` block at the top of the file. The minified build compresses that block into a single line, so it is impractical to edit by hand.
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
@@ -90,12 +99,18 @@ Internal thresholds can be customized in the `DEFAULT_CONFIG` block at the top o
 | `confirmBeforeArchive` | `false` | Prompt before a manual archive pass |
 | `confirmBeforeStart` | `true` | Prompt before starting suggestions in bulk |
 | `maxSuggestionStartsPerRun` | `50` | Hard cap on suggestions started per run |
-| `suggestionStartTimeoutMs` | `6000` | Maximum wait (ms) for a suggestion to register as started |
+| `suggestionStartTimeoutMs` | `6500` | Maximum wait (ms) for a suggestion to register as started |
 | `timeoutMs` | `3500` | Maximum wait time (ms) for row removal or dialog confirmation |
 | `pollIntervalMs` | `100` | Fallback heartbeat interval (ms) alongside `MutationObserver` |
 | `retryAttemptsPerRow` | `2` | Attempts allowed per row before marking it skipped for the current route |
 | `maxConsecutiveFailures` | `5` | Consecutive skipped rows before tripping the circuit breaker |
 | `maxTotalOperations` | `500` | Hard cap on archive operations per execution pass |
+
+---
+
+## Development
+
+`jules-enhancement-suite.user.js` is the source of truth. `jules-enhancement-suite.min.user.js` is generated from it by the [Minify userscript](.github/workflows/minify-userscript.yml) GitHub Actions workflow on every push to `main` that changes the source, so do not edit the minified file by hand. The userscript metadata block is preserved, and the update URLs in the minified header point at the minified file.
 
 ---
 
