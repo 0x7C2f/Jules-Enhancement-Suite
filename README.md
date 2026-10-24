@@ -3,7 +3,7 @@
 A UI enhancement and workflow automation userscript for [`jules.google.com`](https://jules.google.com/) featuring automatic repository group expansion, fault-tolerant session archiving, dedicated toolbar controls, keyboard shortcuts, and observer-backed Angular CDK synchronization.
 
 [![Install Userscript](https://img.shields.io/badge/Install-jules--enhancement--suite.user.js-715cd7?style=flat-square)](https://raw.githubusercontent.com/0x7C2f/Jules-Enhancement-Suite/main/jules-enhancement-suite.user.js)
-![Version](https://img.shields.io/badge/version-3.1.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-3.2.0-blue?style=flat-square)
 
 ---
 
@@ -11,7 +11,7 @@ A UI enhancement and workflow automation userscript for [`jules.google.com`](htt
 
 * **Suite Toolbar Controls:** Injects a native-styled control group into the top toolbar featuring a one-click **Expand All / Collapse All** toggle (`Alt+Shift+E`) and **Archive Sessions** (`Alt+Shift+A`) buttons with live progress indicators.
 * **Expand/Collapse Toggle:** One button, hotkey, and menu command that flips every repository group open or closed. The label tracks the real state, even when you open or close a group by hand. After you collapse, the script will not re-expand groups on its own until you expand again or run the archiver.
-* **Start Suggestions in Bulk:** Adds a **Start suggestions** row under the suggestion filter chips with an **All** button plus one button per category (for example Cleanup, Code Health, Testing). Categories are read from the page, so new ones appear automatically.
+* **Start Suggestions in Bulk:** Adds a **Start suggestions** row under the suggestion filter chips with an **All** button, one button per category (for example Cleanup, Code Health, Testing), and one button per confidence level (High, Medium, Low). Categories and levels are read from the page, so new ones appear automatically.
 * **Automatic Sidebar Group Expansion:** Automatically expands collapsed repository sections (`.collapsible-wrapper`) as the sidebar renders, independent of whether auto-archiving is enabled.
 * **Smart Session Archiver:** Automatically paginates and archives completed or failed coding sessions while protecting active tasks and the currently viewed session.
 * **Keyboard Navigation Suite:** Built-in hotkeys to toggle the sidebar panel (`Alt+Shift+S`), expand and paginate all sessions (`Alt+Shift+E`), and start/stop session archiving (`Alt+Shift+A` / `Esc`).
@@ -43,6 +43,7 @@ Two buttons are injected into the top toolbar on `jules.google.com`:
 The suggestion filter chips get a **Start suggestions** row beneath them:
 * **All:** Selects the **All** filter and starts every suggestion.
 * **Category buttons:** Select that category's filter chip and start only its suggestions, then restore the filter you had selected.
+* **Confidence buttons:** Start only suggestions with that confidence rating, read from each suggestion's confidence indicator. They work within the filter that is currently selected, so select **Testing** and click **High** to start only high-confidence testing suggestions. They do not change your filter.
 * While running, the active button shows live progress (`Starting (3/9) - Stop`). Click it or press `Esc` to stop after the current suggestion.
 * Each suggestion is started once. A confirmation prompt appears first by default because every start creates a session that counts toward your usage limits. Runs are capped at `50` suggestions.
 * If starting a suggestion navigates to the new session, the script goes back to the suggestions list and continues.
@@ -66,6 +67,7 @@ Open your userscript manager's extension popup while on `jules.google.com` to co
 * **Show Eligible Session Count**: Report how many currently loaded sessions would be archived, without archiving anything.
 * **Start All Suggestions (`Alt+Shift+T`)**: Start every suggestion.
 * **Start Suggestions: `[Category]`**: One command per category currently shown on the page.
+* **Start Suggestions: `[Level]` confidence**: One command per confidence level (High, Medium, Low).
 * **Auto-Archive Sessions: `[ON/OFF]`**: Automatically archive eligible sessions on initial page load and SPA route changes (Default: `ON`).
 * **Auto-Expand Repo Groups: `[ON/OFF]`**: Automatically expand collapsed repository sections in the sidebar even when Auto-Archive is off (Default: `ON`).
 * **Archive Only Completed/Failed: `[ON/OFF]`**: Skip sessions showing running, busy, or awaiting-feedback indicators (Default: `ON`).
